@@ -24,9 +24,25 @@
 #include "driverlib/uart.h"     // UART.h
 #include "driverlib/pin_map.h"  // PIN_MAP.h para configurar os pinos
 
-#define UART_CARACTERE  1
-#define UART_QUEUE      2
-#define UART_STRING     UART_CARACTERE
+#define UART_CARACTERE      1
+
+
+/*
+ * Ao inves de jogar os dados no registrador e controlar pelo registrador. Eu adiciono os
+ * dados em uma fila, e quem controla a transmissão é a própria fila.
+ *
+ * CUSTO:
+ *  Uma fila a mais adicionada.
+ *
+ * BENEFICIO:
+ *  - A tarefa só volta a executar quando terminar a frase inteira. Na implementação anterior, a
+ *  tarefa era chamada uma vez para cada caractere, até que terminasse a transmissão.
+ *  - Tenho menos troca de contexto, já que to aproveitando a interrupção de TX para transmitir tudo.
+ */
+
+// Otimização - Evita ficar voltando na função toda vez - Comentado acima
+#define UART_QUEUE          2
+#define UART_STRING         UART_QUEUE
 
 
 //*****************************************************************************
@@ -202,7 +218,7 @@ void Terminal(void *param){
             }
             else{       // Deu tudo certo, agora vou inicializar o periférico
                 #if UART_STRING == UART_QUEUE
-                    qUART0Tx =  xQueuCreate(128, sizeof(char));
+                    qUART0Tx =  xQueueCreate(128, sizeof(char));
                 #endif
 
                     // Enable the peripherals used by this example.
@@ -250,10 +266,10 @@ void Terminal(void *param){
     // Laço infinito que aguarda eu digitar algum caractere
     while(1){
         (void)UARTGetChar(&data, portMAX_DELAY);    // portMAX_delay = Deixa a função em espera indefinidamente, neste caso é até ser digitado algo
-        if(data != 13){                     // Se for diferente de ENTER
-            UARTPutChar(UART0_BASE, data);  // devolve o caractere para o terminal
+        if(data != 13){                             // Se for diferente de ENTER
+            UARTPutChar(UART0_BASE, data);          // devolve o caractere para o terminal
         }
-        else{                               // Quebra de linha
+        else{                                       // Quebra de linha
             UARTPutChar(UART0_BASE, '\n');
             UARTPutChar(UART0_BASE, '\r');
         }
@@ -262,7 +278,7 @@ void Terminal(void *param){
 
 
 #if UART_STRING == UART_QUEUE
-    volatile uint_t isstring = 0;
+    volatile uint32_t isstring = 0;   // Sempre que usar a QUEUE para transmitir, este recebe valor 1 em UARTPutString
 #endif
 
 void UARTIntHandler(void){
@@ -296,7 +312,8 @@ void UARTIntHandler(void){
 
             if(isstring){
                 // read the char to be sent
-                ret = xQueueReceiveFromISR(QUART0Tx, &data, NULL);
+                // Se for string, recebo o caractere da fila Tx
+                ret = xQueueReceiveFromISR(qUART0Tx, &data, NULL);
 
                 if(ret){
                     // Send the char
@@ -396,28 +413,29 @@ void UARTPutString(uint32_t ui32Base, char *string){
 }
 #else
 
+
 void UARTPutString(uint32_t ui32Base, char *string){
+    char data;
     if(mutexTx0 != NULL){
         if(xSemaphoreTake(mutexTx0, portMAX_DELAY) == pdTRUE){
+            isstring = 1;
+            // Vare a string e joga tudo para uma fila
             while(*string){
-                // Send the char
-                // Copia o dado ucData que eu quero transmitir, para o registrador de dados da UART0
-                HWREG(ui32Base + UART_O_DR) = *string;
+                // Joga para o final da fila
+                xQueueSendToBack(qUART0Tx, string, portMAX_DELAY); // DELAY => Se a fila tiver cheia, eu fico esperando ter espaço na fila
 
-                // Wait until space is available.
-                // Esta interrupt vai me avisar quando o buffer tiver vazio (Por isso chamei ela depois de copiar,
-                //  pois senão ela já iria disparar)
-                MAP_UARTIntEnable(UART0_BASE, UART_INT_TX);
-
-                // Wait indefinitely for a UART interrupt
-                // Poderia tambem usar um timeout de 2ms, e se demorasse mais que este timeout aconteceu um erro
-                xSemaphoreTake(sUART0, portMAX_DELAY);  // Sai daqui significa que a transmissão terminou
-
-                string++;       // Avança para o proximo caractere da string
-
+                string++;
             }
 
-            // Terminado a string, libero o recurso
+            // Send the char
+            xQueueReceive(qUART0Tx, &data, portMAX_DELAY);
+            HWREG(ui32Base + UART_O_DR) = data;
+
+            MAP_UARTIntEnable(UART0_BASE, UART_INT_TX);
+
+            // Wait indefinitely the finish of the string transmission by the UART port
+            xSemaphoreTake(sUART0, portMAX_DELAY);
+
             xSemaphoreGive(mutexTx0);
         }
     }
